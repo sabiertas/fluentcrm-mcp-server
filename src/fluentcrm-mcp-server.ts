@@ -202,17 +202,17 @@ class FluentCRMClient {
   }
 
   async attachTagToContact(subscriberId: number, tagIds: number[]) {
-    const response = await this.apiClient.post(
-      `/subscribers/${subscriberId}/tags`,
-      { tags: tagIds }
+    const response = await this.apiClient.put(
+      `/subscribers/${subscriberId}`,
+      { attach_tags: tagIds }
     );
     return response.data;
   }
 
   async detachTagFromContact(subscriberId: number, tagIds: number[]) {
-    const response = await this.apiClient.post(
-      `/subscribers/${subscriberId}/tags/detach`,
-      { tags: tagIds }
+    const response = await this.apiClient.put(
+      `/subscribers/${subscriberId}`,
+      { detach_tags: tagIds }
     );
     return response.data;
   }
@@ -249,17 +249,17 @@ class FluentCRMClient {
   }
 
   async attachContactToList(subscriberId: number, listIds: number[]) {
-    const response = await this.apiClient.post(
-      `/subscribers/${subscriberId}/lists`,
-      { lists: listIds }
+    const response = await this.apiClient.put(
+      `/subscribers/${subscriberId}`,
+      { attach_lists: listIds }
     );
     return response.data;
   }
 
   async detachContactFromList(subscriberId: number, listIds: number[]) {
-    const response = await this.apiClient.post(
-      `/subscribers/${subscriberId}/lists/detach`,
-      { lists: listIds }
+    const response = await this.apiClient.put(
+      `/subscribers/${subscriberId}`,
+      { detach_lists: listIds }
     );
     return response.data;
   }

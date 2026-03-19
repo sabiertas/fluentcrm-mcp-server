@@ -11,9 +11,49 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-const FLUENTCRM_API_URL = process.env.FLUENTCRM_API_URL || 'https://your-domain.com/wp-json/fluent-crm/v2';
-const FLUENTCRM_API_USERNAME = process.env.FLUENTCRM_API_USERNAME || '';
-const FLUENTCRM_API_PASSWORD = process.env.FLUENTCRM_API_PASSWORD || '';
+// ===== MULTI-SITE CONFIG =====
+
+interface SiteConfig {
+  url: string;
+  username: string;
+  password: string;
+}
+
+function loadSiteConfigs(): Map<string, SiteConfig> {
+  const configs = new Map<string, SiteConfig>();
+
+  const sitesEnv = process.env.FLUENTCRM_SITES;
+  if (sitesEnv) {
+    try {
+      const parsed = JSON.parse(sitesEnv) as Record<string, SiteConfig>;
+      for (const [name, config] of Object.entries(parsed)) {
+        if (config.url && config.username && config.password) {
+          configs.set(name, config);
+        } else {
+          console.error(`Warning: Site "${name}" is missing url, username, or password — skipped`);
+        }
+      }
+    } catch (e) {
+      console.error('Error parsing FLUENTCRM_SITES JSON:', e);
+    }
+  }
+
+  // Backward compatibility: fall back to single env vars
+  if (configs.size === 0) {
+    const url = process.env.FLUENTCRM_API_URL || '';
+    const username = process.env.FLUENTCRM_API_USERNAME || '';
+    const password = process.env.FLUENTCRM_API_PASSWORD || '';
+    if (url && username && password) {
+      configs.set('default', { url, username, password });
+    }
+  }
+
+  return configs;
+}
+
+const siteConfigs = loadSiteConfigs();
+const siteNames = Array.from(siteConfigs.keys());
+const siteDescription = `Site identifier (e.g. ${siteNames.map(s => `'${s}'`).join(', ')}). Available: ${siteNames.join(', ')}. Defaults to '${siteNames[0] || 'default'}'.`;
 
 /**
  * FluentCRM API Client
@@ -25,10 +65,10 @@ class FluentCRMClient {
 
   constructor(baseURL: string, username: string, password: string) {
     this.baseURL = baseURL;
-    
+
     // Basic Auth dla FluentCRM API
     const credentials = Buffer.from(`${username}:${password}`).toString('base64');
-    
+
     this.apiClient = axios.create({
       baseURL,
       headers: {
@@ -39,18 +79,29 @@ class FluentCRMClient {
       timeout: 30000,
     });
 
-    // Error interceptor
+    // Error interceptor — capture validation details from 422 responses
     this.apiClient.interceptors.response.use(
       response => response,
       error => {
+        const status = error.response?.status;
         const message = error.response?.data?.message || error.message;
-        throw new Error(`FluentCRM API Error: ${message}`);
+        const errors = error.response?.data?.errors;
+        const data = error.response?.data;
+
+        let fullMessage = `FluentCRM API Error (${status}): ${message}`;
+        if (errors) {
+          fullMessage += ` | Validation errors: ${JSON.stringify(errors)}`;
+        }
+        if (status === 422 && data) {
+          fullMessage += ` | Full response: ${JSON.stringify(data)}`;
+        }
+        throw new Error(fullMessage);
       }
     );
   }
 
   // ===== SUBSCRIBERS / KONTAKTY =====
-  
+
   async listContacts(params: any = {}) {
     const response = await this.apiClient.get('/subscribers', { params });
     return response.data;
@@ -78,10 +129,35 @@ class FluentCRMClient {
     state?: string;
     country?: string;
     postal_code?: string;
+    status?: string;
+    contact_type?: string;
+    tags?: number[];
+    lists?: number[];
     [key: string]: any;
   }) {
-    const response = await this.apiClient.post('/subscribers', data);
-    return response.data;
+    // Default status to 'subscribed' if not provided — FluentCRM requires it
+    const payload = {
+      status: 'subscribed',
+      ...data,
+    };
+    try {
+      const response = await this.apiClient.post('/subscribers', payload);
+      return response.data;
+    } catch (error: any) {
+      // FluentCRM sometimes returns 500 but still creates the contact (server-side bug).
+      // If we get 500, check if the contact was created anyway by searching for it.
+      const status = error.message?.includes('(500)') || error.message?.includes('internal_server_error');
+      if (status && data.email) {
+        const existing = await this.findContactByEmail(data.email);
+        if (existing) {
+          return {
+            ...existing,
+            _note: 'Contact was created despite 500 error from FluentCRM. This is a known FluentCRM bug.',
+          };
+        }
+      }
+      throw error;
+    }
   }
 
   async updateContact(subscriberId: number, data: any) {
@@ -425,23 +501,23 @@ class FluentCRMClient {
   // Helper method to validate Smart Link data
   validateSmartLinkData(data: any): { valid: boolean; errors: string[] } {
     const errors: string[] = [];
-    
+
     if (!data.title || typeof data.title !== 'string') {
       errors.push('Title is required and must be a string');
     }
-    
+
     if (!data.target_url || typeof data.target_url !== 'string') {
       errors.push('Target URL is required and must be a string');
     }
-    
+
     if (data.target_url && !data.target_url.startsWith('http')) {
       errors.push('Target URL must start with http:// or https://');
     }
-    
+
     if (data.slug && !/^[a-z0-9-]+$/.test(data.slug)) {
       errors.push('Slug must contain only lowercase letters, numbers, and hyphens');
     }
-    
+
     return {
       valid: errors.length === 0,
       errors
@@ -466,7 +542,7 @@ class FluentCRMClient {
 const server = new Server(
   {
     name: 'fluentcrm-mcp',
-    version: '1.0.0',
+    version: '1.1.0',
   },
   {
     capabilities: {
@@ -475,11 +551,32 @@ const server = new Server(
   }
 );
 
-const client = new FluentCRMClient(
-  FLUENTCRM_API_URL,
-  FLUENTCRM_API_USERNAME,
-  FLUENTCRM_API_PASSWORD
-);
+// ===== MULTI-SITE CLIENT MANAGEMENT =====
+
+const clients = new Map<string, FluentCRMClient>();
+
+for (const [name, config] of siteConfigs.entries()) {
+  clients.set(name, new FluentCRMClient(config.url, config.username, config.password));
+}
+
+function getClient(siteName?: string): FluentCRMClient {
+  if (clients.size === 0) {
+    throw new Error('No FluentCRM sites configured. Set FLUENTCRM_SITES or FLUENTCRM_API_URL/USERNAME/PASSWORD env vars.');
+  }
+
+  if (!siteName) {
+    return clients.values().next().value!;
+  }
+
+  const client = clients.get(siteName);
+  if (!client) {
+    throw new Error(`Site "${siteName}" not found. Available sites: ${siteNames.join(', ')}`);
+  }
+  return client;
+}
+
+// Helper: site property for tool schemas
+const siteProp = { type: 'string' as const, description: siteDescription };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -491,6 +588,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             page: { type: 'number', description: 'Numer strony (default: 1)' },
             per_page: { type: 'number', description: 'Ilość rekordów na stronę (default: 10)' },
             search: { type: 'string', description: 'Szukaj po emailu/imieniu' },
@@ -503,6 +601,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
           },
           required: ['subscriberId'],
@@ -514,6 +613,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             email: { type: 'string', description: 'Adres email' },
           },
           required: ['email'],
@@ -521,17 +621,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'fluentcrm_create_contact',
-        description: 'Tworzy nowy kontakt w FluentCRM',
+        description: 'Crea un nuevo contacto en FluentCRM. Por defecto status=subscribed.',
         inputSchema: {
           type: 'object',
           properties: {
-            email: { type: 'string', description: 'Email kontaktu' },
-            first_name: { type: 'string', description: 'Imię' },
-            last_name: { type: 'string', description: 'Nazwisko' },
-            phone: { type: 'string', description: 'Numer telefonu' },
-            address_line_1: { type: 'string', description: 'Adres' },
-            city: { type: 'string', description: 'Miasto' },
-            country: { type: 'string', description: 'Kraj' },
+            site: siteProp,
+            email: { type: 'string', description: 'Email del contacto (obligatorio)' },
+            first_name: { type: 'string', description: 'Nombre' },
+            last_name: { type: 'string', description: 'Apellido' },
+            phone: { type: 'string', description: 'Telefono' },
+            address_line_1: { type: 'string', description: 'Direccion' },
+            city: { type: 'string', description: 'Ciudad' },
+            country: { type: 'string', description: 'Pais (codigo ISO, ej: ES)' },
+            status: { type: 'string', description: 'Estado: subscribed (default), pending, unsubscribed', enum: ['subscribed', 'pending', 'unsubscribed'] },
+            contact_type: { type: 'string', description: 'Tipo: lead (default), customer', enum: ['lead', 'customer'] },
+            tags: { type: 'array', items: { type: 'number' }, description: 'IDs de tags a asignar al crear' },
+            lists: { type: 'array', items: { type: 'number' }, description: 'IDs de listas a asignar al crear' },
+            company_id: { type: 'string', description: 'Nombre de la empresa' },
           },
           required: ['email'],
         },
@@ -542,6 +648,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
             first_name: { type: 'string' },
             last_name: { type: 'string' },
@@ -556,6 +663,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu do usunięcia' },
           },
           required: ['subscriberId'],
@@ -569,6 +677,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             page: { type: 'number', description: 'Numer strony' },
             search: { type: 'string', description: 'Szukaj tagu' },
           },
@@ -580,6 +689,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa tagu (np. "AW-progress-75")' },
             slug: { type: 'string', description: 'Slug tagu (np. "aw-progress-75")' },
             description: { type: 'string', description: 'Opis tagu' },
@@ -593,6 +703,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             tagId: { type: 'number', description: 'ID tagu' },
           },
           required: ['tagId'],
@@ -604,6 +715,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
             tagIds: { type: 'array', items: { type: 'number' }, description: 'Lista ID tagów' },
           },
@@ -616,6 +728,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
             tagIds: { type: 'array', items: { type: 'number' }, description: 'Lista ID tagów' },
           },
@@ -629,7 +742,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Pobiera wszystkie listy z FluentCRM',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            site: siteProp,
+          },
         },
       },
       {
@@ -638,6 +753,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa listy' },
             slug: { type: 'string', description: 'Slug listy' },
             description: { type: 'string', description: 'Opis listy' },
@@ -651,6 +767,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             listId: { type: 'number', description: 'ID listy' },
           },
           required: ['listId'],
@@ -662,6 +779,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
             listIds: { type: 'array', items: { type: 'number' }, description: 'Lista ID list' },
           },
@@ -674,6 +792,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             subscriberId: { type: 'number', description: 'ID kontaktu' },
             listIds: { type: 'array', items: { type: 'number' }, description: 'Lista ID list' },
           },
@@ -688,6 +807,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             page: { type: 'number' },
             search: { type: 'string' },
           },
@@ -699,6 +819,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Tytuł kampanii' },
             subject: { type: 'string', description: 'Temat emaila' },
             template_id: { type: 'number', description: 'ID szablonu' },
@@ -713,6 +834,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             campaignId: { type: 'number', description: 'ID kampanii' },
           },
           required: ['campaignId'],
@@ -724,6 +846,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             campaignId: { type: 'number', description: 'ID kampanii' },
           },
           required: ['campaignId'],
@@ -735,6 +858,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             campaignId: { type: 'number', description: 'ID kampanii' },
           },
           required: ['campaignId'],
@@ -747,7 +871,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Pobiera szablony email',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            site: siteProp,
+          },
         },
       },
       {
@@ -756,6 +882,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa szablonu' },
             subject: { type: 'string', description: 'Temat' },
             body: { type: 'string', description: 'Treść HTML' },
@@ -771,6 +898,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             page: { type: 'number' },
             search: { type: 'string' },
           },
@@ -782,6 +910,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa automatyzacji' },
             description: { type: 'string' },
             trigger: { type: 'string', description: 'Typ triggera' },
@@ -796,7 +925,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Pobiera webhooks',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            site: siteProp,
+          },
         },
       },
       {
@@ -805,6 +936,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             name: { type: 'string', description: 'Nazwa webhook' },
             url: { type: 'string', description: 'URL webhook' },
             status: { type: 'string', enum: ['pending', 'subscribed'] },
@@ -822,6 +954,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             page: { type: 'number', description: 'Numer strony' },
             search: { type: 'string', description: 'Szukaj Smart Link' },
           },
@@ -833,6 +966,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             smartLinkId: { type: 'number', description: 'ID Smart Link' },
           },
           required: ['smartLinkId'],
@@ -844,6 +978,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa Smart Link (np. "AW-Link-Webinar-Mail")' },
             slug: { type: 'string', description: 'Slug (np. "aw-link-webinar-mail")' },
             target_url: { type: 'string', description: 'Docelowy URL' },
@@ -862,6 +997,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             smartLinkId: { type: 'number', description: 'ID Smart Link' },
             title: { type: 'string' },
             target_url: { type: 'string' },
@@ -880,6 +1016,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             smartLinkId: { type: 'number', description: 'ID Smart Link do usunięcia' },
           },
           required: ['smartLinkId'],
@@ -891,6 +1028,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             slug: { type: 'string', description: 'Slug Smart Link' },
             linkText: { type: 'string', description: 'Tekst linku (opcjonalny)' },
           },
@@ -903,6 +1041,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {
+            site: siteProp,
             title: { type: 'string', description: 'Nazwa Smart Link' },
             slug: { type: 'string', description: 'Slug' },
             target_url: { type: 'string', description: 'Docelowy URL' },
@@ -922,7 +1061,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Pobiera statystyki dashboarda',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            site: siteProp,
+          },
         },
       },
       {
@@ -930,7 +1071,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description: 'Pobiera pola niestandardowe',
         inputSchema: {
           type: 'object',
-          properties: {},
+          properties: {
+            site: siteProp,
+          },
         },
       },
     ],
@@ -939,90 +1082,92 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const site = (args as any)?.site;
+  const siteClient = getClient(site);
 
   try {
     switch (name) {
       case 'fluentcrm_list_contacts':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listContacts(args || {}), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listContacts(args || {}), null, 2) }] };
       case 'fluentcrm_get_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getContact((args as any)?.subscriberId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getContact((args as any)?.subscriberId), null, 2) }] };
       case 'fluentcrm_find_contact_by_email':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.findContactByEmail((args as any)?.email), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.findContactByEmail((args as any)?.email), null, 2) }] };
       case 'fluentcrm_create_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createContact(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createContact(args as any), null, 2) }] };
       case 'fluentcrm_update_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.updateContact((args as any)?.subscriberId, args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.updateContact((args as any)?.subscriberId, args as any), null, 2) }] };
       case 'fluentcrm_delete_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteContact((args as any)?.subscriberId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteContact((args as any)?.subscriberId), null, 2) }] };
       case 'fluentcrm_list_tags':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listTags(args || {}), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listTags(args || {}), null, 2) }] };
       case 'fluentcrm_create_tag':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createTag(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createTag(args as any), null, 2) }] };
       case 'fluentcrm_delete_tag':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteTag((args as any)?.tagId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteTag((args as any)?.tagId), null, 2) }] };
       case 'fluentcrm_attach_tag_to_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.attachTagToContact((args as any)?.subscriberId, (args as any)?.tagIds), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.attachTagToContact((args as any)?.subscriberId, (args as any)?.tagIds), null, 2) }] };
       case 'fluentcrm_detach_tag_from_contact':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.detachTagFromContact((args as any)?.subscriberId, (args as any)?.tagIds), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.detachTagFromContact((args as any)?.subscriberId, (args as any)?.tagIds), null, 2) }] };
       case 'fluentcrm_list_lists':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listLists(), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listLists(), null, 2) }] };
       case 'fluentcrm_create_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createList(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createList(args as any), null, 2) }] };
       case 'fluentcrm_delete_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteList((args as any)?.listId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteList((args as any)?.listId), null, 2) }] };
       case 'fluentcrm_attach_contact_to_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.attachContactToList((args as any)?.subscriberId, (args as any)?.listIds), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.attachContactToList((args as any)?.subscriberId, (args as any)?.listIds), null, 2) }] };
       case 'fluentcrm_detach_contact_from_list':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.detachContactFromList((args as any)?.subscriberId, (args as any)?.listIds), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.detachContactFromList((args as any)?.subscriberId, (args as any)?.listIds), null, 2) }] };
       case 'fluentcrm_list_campaigns':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listCampaigns(args || {}), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listCampaigns(args || {}), null, 2) }] };
       case 'fluentcrm_create_campaign':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createCampaign(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createCampaign(args as any), null, 2) }] };
       case 'fluentcrm_pause_campaign':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.pauseCampaign((args as any)?.campaignId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.pauseCampaign((args as any)?.campaignId), null, 2) }] };
       case 'fluentcrm_resume_campaign':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.resumeCampaign((args as any)?.campaignId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.resumeCampaign((args as any)?.campaignId), null, 2) }] };
       case 'fluentcrm_delete_campaign':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteCampaign((args as any)?.campaignId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteCampaign((args as any)?.campaignId), null, 2) }] };
       case 'fluentcrm_list_email_templates':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listEmailTemplates(), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listEmailTemplates(), null, 2) }] };
       case 'fluentcrm_create_email_template':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createEmailTemplate(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createEmailTemplate(args as any), null, 2) }] };
       case 'fluentcrm_list_automations':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listAutomations(args || {}), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listAutomations(args || {}), null, 2) }] };
       case 'fluentcrm_create_automation':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createAutomation(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createAutomation(args as any), null, 2) }] };
       case 'fluentcrm_list_webhooks':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listWebhooks(), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listWebhooks(), null, 2) }] };
       case 'fluentcrm_create_webhook':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createWebhook(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createWebhook(args as any), null, 2) }] };
       case 'fluentcrm_dashboard_stats':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getDashboardStats(), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getDashboardStats(), null, 2) }] };
       case 'fluentcrm_custom_fields':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listCustomFields(), null, 2) }] };
-      
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listCustomFields(), null, 2) }] };
+
       // ===== SMART LINKS =====
       case 'fluentcrm_list_smart_links':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.listSmartLinks(args || {}), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listSmartLinks(args || {}), null, 2) }] };
       case 'fluentcrm_get_smart_link':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.getSmartLink((args as any)?.smartLinkId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getSmartLink((args as any)?.smartLinkId), null, 2) }] };
       case 'fluentcrm_create_smart_link':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.createSmartLink(args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createSmartLink(args as any), null, 2) }] };
       case 'fluentcrm_update_smart_link':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.updateSmartLink((args as any)?.smartLinkId, args as any), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.updateSmartLink((args as any)?.smartLinkId, args as any), null, 2) }] };
       case 'fluentcrm_delete_smart_link':
-        return { content: [{ type: 'text', text: JSON.stringify(await client.deleteSmartLink((args as any)?.smartLinkId), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteSmartLink((args as any)?.smartLinkId), null, 2) }] };
       case 'fluentcrm_generate_smart_link_shortcode':
-        return { content: [{ type: 'text', text: JSON.stringify({ shortcode: client.generateSmartLinkShortcode((args as any)?.slug, (args as any)?.linkText) }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ shortcode: siteClient.generateSmartLinkShortcode((args as any)?.slug, (args as any)?.linkText) }, null, 2) }] };
       case 'fluentcrm_validate_smart_link_data':
-        return { content: [{ type: 'text', text: JSON.stringify(client.validateSmartLinkData(args as any), null, 2) }] };
-      
+        return { content: [{ type: 'text', text: JSON.stringify(siteClient.validateSmartLinkData(args as any), null, 2) }] };
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
     return {
-      content: [{ type: 'text', text: `❌ Error: ${error.message}` }],
+      content: [{ type: 'text', text: `Error: ${error.message}` }],
       isError: true,
     };
   }
@@ -1031,12 +1176,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('🚀 FluentCRM MCP Server running on stdio');
-  console.error(`📡 API URL: ${FLUENTCRM_API_URL}`);
-  console.error(`👤 Username: ${FLUENTCRM_API_USERNAME}`);
+  console.error('FluentCRM MCP Server v1.1.0 running on stdio (multi-site)');
+  console.error(`Configured sites: ${siteNames.join(', ') || '(none)'}`);
+  for (const [name, config] of siteConfigs.entries()) {
+    console.error(`  [${name}] ${config.url} (user: ${config.username})`);
+  }
 }
 
 main().catch((error) => {
-  console.error('❌ Server error:', error);
+  console.error('Server error:', error);
   process.exit(1);
 });

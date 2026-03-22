@@ -335,8 +335,12 @@ class FluentCRMClient {
     return response.data;
   }
 
-  async getAutomation(funnelId: number) {
-    const response = await this.apiClient.get(`/funnels/${funnelId}`);
+  async getAutomation(funnelId: number, withSequences: boolean = false) {
+    const params: any = {};
+    if (withSequences) {
+      params['with[]'] = ['funnel_sequences', 'blocks', 'block_fields'];
+    }
+    const response = await this.apiClient.get(`/funnels/${funnelId}`, { params });
     return response.data;
   }
 
@@ -352,6 +356,82 @@ class FluentCRMClient {
 
   async deleteAutomation(funnelId: number) {
     const response = await this.apiClient.delete(`/funnels/${funnelId}`);
+    return response.data;
+  }
+
+  async cloneAutomation(funnelId: number) {
+    const response = await this.apiClient.post(`/funnels/${funnelId}/clone`);
+    return response.data;
+  }
+
+  async listTriggers() {
+    const response = await this.apiClient.get('/funnels/triggers');
+    return response.data;
+  }
+
+  async saveAutomationSequences(funnelId: number, data: {
+    funnel_title?: string;
+    funnel_description?: string;
+    status?: string;
+    sequences: any[];
+    funnel_settings?: any;
+    conditions?: any;
+  }) {
+    const payload: any = {
+      sequences: JSON.stringify(data.sequences),
+    };
+    if (data.funnel_title) payload.funnel_title = data.funnel_title;
+    if (data.funnel_description) payload.funnel_description = data.funnel_description;
+    if (data.status) payload.status = data.status;
+    if (data.funnel_settings) payload.funnel_settings = JSON.stringify(data.funnel_settings);
+    if (data.conditions) payload.conditions = JSON.stringify(data.conditions);
+
+    const response = await this.apiClient.post(`/funnels/${funnelId}/sequences`, payload);
+    return response.data;
+  }
+
+  async saveEmailAction(funnelId: number, actionData: {
+    action_name: string;
+    mailer_settings?: any;
+    campaign: {
+      id?: number | null;
+      email_subject: string;
+      email_pre_header?: string;
+      email_body: string;
+      design_template?: string;
+      settings?: any;
+    };
+  }) {
+    const response = await this.apiClient.post(`/funnels/${funnelId}/sequences/save-email-action`, {
+      action_data: actionData,
+    });
+    return response.data;
+  }
+
+  async listFunnelSubscribers(funnelId: number, params: any = {}) {
+    const response = await this.apiClient.get(`/funnels/${funnelId}/subscribers`, { params });
+    return response.data;
+  }
+
+  async updateFunnelSubscriberStatus(funnelId: number, subscriberId: number, status: string) {
+    const response = await this.apiClient.put(`/funnels/${funnelId}/subscribers/${subscriberId}/status`, { status });
+    return response.data;
+  }
+
+  async getAutomationReport(funnelId: number) {
+    const response = await this.apiClient.get(`/funnels/${funnelId}/report`);
+    return response.data;
+  }
+
+  async getContactAutomations(subscriberId: number) {
+    const response = await this.apiClient.get(`/funnels/subscriber/${subscriberId}/automations`);
+    return response.data;
+  }
+
+  async changeTrigger(funnelId: number, triggerName: string, title?: string) {
+    const data: any = { trigger_name: triggerName };
+    if (title) data.title = title;
+    const response = await this.apiClient.put(`/funnels/${funnelId}/change-trigger`, data);
     return response.data;
   }
 
@@ -542,7 +622,7 @@ class FluentCRMClient {
 const server = new Server(
   {
     name: 'fluentcrm-mcp',
-    version: '1.1.0',
+    version: '1.2.0',
   },
   {
     capabilities: {
@@ -906,16 +986,196 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'fluentcrm_create_automation',
-        description: 'Tworzy nową automatyzację',
+        description: 'Creates a new automation funnel',
         inputSchema: {
           type: 'object',
           properties: {
             site: siteProp,
-            title: { type: 'string', description: 'Nazwa automatyzacji' },
+            title: { type: 'string', description: 'Automation title' },
             description: { type: 'string' },
-            trigger: { type: 'string', description: 'Typ triggera' },
+            trigger: { type: 'string', description: 'Trigger type (use fluentcrm_list_triggers to see available triggers)' },
           },
           required: ['title', 'trigger'],
+        },
+      },
+      {
+        name: 'fluentcrm_get_automation',
+        description: 'Get automation details including all sequences (steps), available blocks and block fields. Use this to inspect an automation flow.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            withSequences: { type: 'boolean', description: 'Include sequences, blocks and block_fields (default: true)' },
+          },
+          required: ['funnelId'],
+        },
+      },
+      {
+        name: 'fluentcrm_update_automation',
+        description: 'Update automation status (draft/published)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            status: { type: 'string', description: 'New status', enum: ['draft', 'published'] },
+          },
+          required: ['funnelId', 'status'],
+        },
+      },
+      {
+        name: 'fluentcrm_delete_automation',
+        description: 'Delete an automation funnel',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+          },
+          required: ['funnelId'],
+        },
+      },
+      {
+        name: 'fluentcrm_clone_automation',
+        description: 'Duplicate an automation funnel (creates a draft copy with all sequences)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID to clone' },
+          },
+          required: ['funnelId'],
+        },
+      },
+      {
+        name: 'fluentcrm_list_triggers',
+        description: 'List all available automation trigger types. Use this to know which triggers can be used when creating or changing automations.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+          },
+        },
+      },
+      {
+        name: 'fluentcrm_save_automation_sequences',
+        description: 'Save all sequences (steps) for an automation. WARNING: This is a full-state replacement — all sequences not included will be deleted. First use fluentcrm_get_automation to read current sequences, modify the array, then save back. Each sequence needs: action_name, type (action/conditional/benchmark), title, settings.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            funnel_title: { type: 'string', description: 'Updated funnel title (optional)' },
+            funnel_description: { type: 'string', description: 'Updated funnel description (optional)' },
+            status: { type: 'string', description: 'Funnel status', enum: ['draft', 'published'] },
+            sequences: {
+              type: 'array',
+              description: 'Array of sequence objects. Each needs: action_name, type, title, settings. Include id to update existing steps, omit id for new steps.',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'number', description: 'Existing sequence ID (omit for new)' },
+                  action_name: { type: 'string', description: 'Action identifier (e.g. fluentcrm_wait_times, send_custom_email, add_contact_to_tags)' },
+                  type: { type: 'string', description: 'Step type', enum: ['action', 'conditional', 'benchmark'] },
+                  title: { type: 'string', description: 'Step title' },
+                  description: { type: 'string' },
+                  settings: { type: 'object', description: 'Action-specific settings' },
+                  conditions: { type: 'array', description: 'Step conditions' },
+                  parent_id: { type: 'number', description: '0 for root level, or parent conditional block ID' },
+                  condition_type: { type: 'string', description: '"yes" or "no" when inside a conditional block', enum: ['yes', 'no'] },
+                },
+              },
+            },
+            funnel_settings: { type: 'object', description: 'Funnel-level settings (optional)' },
+            conditions: { type: 'object', description: 'Funnel-level conditions (optional)' },
+          },
+          required: ['funnelId', 'sequences'],
+        },
+      },
+      {
+        name: 'fluentcrm_save_email_action',
+        description: 'Save or update an email for a send_custom_email step in an automation. Returns the reference campaign ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            action_name: { type: 'string', description: 'Action name (default: send_custom_email)' },
+            campaign_id: { type: 'number', description: 'Existing campaign ID to update (null for new)' },
+            email_subject: { type: 'string', description: 'Email subject line' },
+            email_pre_header: { type: 'string', description: 'Email pre-header text' },
+            email_body: { type: 'string', description: 'Email HTML body' },
+            design_template: { type: 'string', description: 'Template type (default: simple)' },
+          },
+          required: ['funnelId', 'email_subject', 'email_body'],
+        },
+      },
+      {
+        name: 'fluentcrm_list_funnel_subscribers',
+        description: 'List contacts enrolled in an automation funnel. Can filter by status (active/completed/cancelled).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            search: { type: 'string', description: 'Search by name/email' },
+            status: { type: 'string', description: 'Filter by status', enum: ['active', 'completed', 'cancelled'] },
+            page: { type: 'number', description: 'Page number' },
+          },
+          required: ['funnelId'],
+        },
+      },
+      {
+        name: 'fluentcrm_update_funnel_subscriber_status',
+        description: 'Update a subscriber status within an automation (complete or cancel their run)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            subscriberId: { type: 'number', description: 'Subscriber ID within the funnel' },
+            status: { type: 'string', description: 'New status', enum: ['completed', 'cancelled'] },
+          },
+          required: ['funnelId', 'subscriberId', 'status'],
+        },
+      },
+      {
+        name: 'fluentcrm_get_automation_report',
+        description: 'Get performance report/stats for an automation funnel',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+          },
+          required: ['funnelId'],
+        },
+      },
+      {
+        name: 'fluentcrm_get_contact_automations',
+        description: 'List all automation funnels that a specific contact is enrolled in',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            subscriberId: { type: 'number', description: 'Contact/subscriber ID' },
+          },
+          required: ['subscriberId'],
+        },
+      },
+      {
+        name: 'fluentcrm_change_trigger',
+        description: 'Change the trigger of an existing automation. WARNING: This resets funnel settings and conditions.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            funnelId: { type: 'number', description: 'Automation/funnel ID' },
+            trigger_name: { type: 'string', description: 'New trigger name (use fluentcrm_list_triggers to see options)' },
+            title: { type: 'string', description: 'New automation title (optional)' },
+          },
+          required: ['funnelId', 'trigger_name'],
         },
       },
 
@@ -1137,6 +1397,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listAutomations(args || {}), null, 2) }] };
       case 'fluentcrm_create_automation':
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createAutomation(args as any), null, 2) }] };
+      case 'fluentcrm_get_automation':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getAutomation((args as any)?.funnelId, (args as any)?.withSequences !== false), null, 2) }] };
+      case 'fluentcrm_update_automation':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.updateAutomation((args as any)?.funnelId, { status: (args as any)?.status }), null, 2) }] };
+      case 'fluentcrm_delete_automation':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.deleteAutomation((args as any)?.funnelId), null, 2) }] };
+      case 'fluentcrm_clone_automation':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.cloneAutomation((args as any)?.funnelId), null, 2) }] };
+      case 'fluentcrm_list_triggers':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listTriggers(), null, 2) }] };
+      case 'fluentcrm_save_automation_sequences':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.saveAutomationSequences((args as any)?.funnelId, {
+          funnel_title: (args as any)?.funnel_title,
+          funnel_description: (args as any)?.funnel_description,
+          status: (args as any)?.status,
+          sequences: (args as any)?.sequences,
+          funnel_settings: (args as any)?.funnel_settings,
+          conditions: (args as any)?.conditions,
+        }), null, 2) }] };
+      case 'fluentcrm_save_email_action':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.saveEmailAction((args as any)?.funnelId, {
+          action_name: (args as any)?.action_name || 'send_custom_email',
+          campaign: {
+            id: (args as any)?.campaign_id || null,
+            email_subject: (args as any)?.email_subject,
+            email_pre_header: (args as any)?.email_pre_header || '',
+            email_body: (args as any)?.email_body,
+            design_template: (args as any)?.design_template || 'simple',
+          },
+        }), null, 2) }] };
+      case 'fluentcrm_list_funnel_subscribers':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listFunnelSubscribers((args as any)?.funnelId, {
+          search: (args as any)?.search,
+          status: (args as any)?.status,
+          page: (args as any)?.page,
+        }), null, 2) }] };
+      case 'fluentcrm_update_funnel_subscriber_status':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.updateFunnelSubscriberStatus((args as any)?.funnelId, (args as any)?.subscriberId, (args as any)?.status), null, 2) }] };
+      case 'fluentcrm_get_automation_report':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getAutomationReport((args as any)?.funnelId), null, 2) }] };
+      case 'fluentcrm_get_contact_automations':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.getContactAutomations((args as any)?.subscriberId), null, 2) }] };
+      case 'fluentcrm_change_trigger':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.changeTrigger((args as any)?.funnelId, (args as any)?.trigger_name, (args as any)?.title), null, 2) }] };
       case 'fluentcrm_list_webhooks':
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listWebhooks(), null, 2) }] };
       case 'fluentcrm_create_webhook':
@@ -1176,7 +1480,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('FluentCRM MCP Server v1.1.0 running on stdio (multi-site)');
+  console.error('FluentCRM MCP Server v1.2.0 running on stdio (multi-site)');
   console.error(`Configured sites: ${siteNames.join(', ') || '(none)'}`);
   for (const [name, config] of siteConfigs.entries()) {
     console.error(`  [${name}] ${config.url} (user: ${config.username})`);

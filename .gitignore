@@ -90,3 +90,5 @@ jspm_packages/
 # MCP Configuration with sensitive data
 cursor_mcp_config.json
 mcp_config.json
+# Claude Code local
+.claude/

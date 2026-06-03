@@ -301,6 +301,106 @@ class FluentCRMClient {
     return response.data;
   }
 
+  async composeCampaignWithTemplate(params: {
+    campaignId?: number;
+    title: string;
+    subject: string;
+    template_id: number;
+    greeting?: string;
+    body?: string;
+    signature?: string;
+    settings?: any;
+  }) {
+    // 1. Fetch the template
+    const templateResp = await this.getEmailTemplate(params.template_id);
+    const template = templateResp?.template || templateResp;
+    let html = template?.post_content || '';
+
+    if (!html) {
+      throw new Error(`Template ${params.template_id} has no content (post_content is empty)`);
+    }
+
+    // 2. Find and replace text blocks in template HTML
+    // FluentCRM visual builder templates use u_content_text_N pattern
+    const textBlockPattern = /(id="u_content_text_\d+"[^>]*>.*?word-wrap:\s*break-word;">\s*\n)(.*?)(\s*<\/div>\s*\n\s*<\/td>)/gs;
+    const blocks: { start: number; end: number; content: string }[] = [];
+    let match;
+
+    while ((match = textBlockPattern.exec(html)) !== null) {
+      blocks.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        content: match[2],
+      });
+    }
+
+    // Replace blocks in reverse order to preserve indices
+    const replacements = [params.greeting, params.body, params.signature].filter(Boolean);
+
+    if (blocks.length >= 3 && replacements.length > 0) {
+      // Template has structured blocks: greeting (0), body (1), signature (2)
+      // Work backwards to preserve string positions
+      if (params.signature && blocks.length > 2) {
+        html = html.substring(0, blocks[2].start) +
+          html.substring(blocks[2].start, blocks[2].end).replace(blocks[2].content, '\n' + params.signature + '\n') +
+          html.substring(blocks[2].end);
+      }
+      if (params.body && blocks.length > 1) {
+        html = html.substring(0, blocks[1].start) +
+          html.substring(blocks[1].start, blocks[1].end).replace(blocks[1].content, '\n' + params.body + '\n') +
+          html.substring(blocks[1].end);
+      }
+      if (params.greeting && blocks.length > 0) {
+        html = html.substring(0, blocks[0].start) +
+          html.substring(blocks[0].start, blocks[0].end).replace(blocks[0].content, '\n' + params.greeting + '\n') +
+          html.substring(blocks[0].end);
+      }
+    } else if (blocks.length > 0 && params.body) {
+      // Simple template with fewer blocks - replace the largest block with body
+      const largestBlock = blocks.reduce((a, b) => a.content.length > b.content.length ? a : b);
+      html = html.substring(0, largestBlock.start) +
+        html.substring(largestBlock.start, largestBlock.end).replace(largestBlock.content, '\n' + (params.greeting || '') + '\n' + params.body + '\n' + (params.signature || '') + '\n') +
+        html.substring(largestBlock.end);
+    }
+
+    // 3. Remove template-specific buttons (like "Descargar informe mensual")
+    // Keep only the unsubscribe link and contact info blocks
+    html = html.replace(/<a[^>]*style="[^"]*background-color[^"]*"[^>]*>(?!.*[Uu]nsubscribe).*?<\/a>/g, (match: string) => {
+      if (match.includes('Unsubscribe') || match.includes('unsubscribe') || match.includes('crm.unsubscribe')) {
+        return match; // Keep unsubscribe links
+      }
+      return ''; // Remove other styled buttons
+    });
+
+    // 4. Create or update campaign with composed HTML
+    const campaignData: any = {
+      title: params.title,
+      email_subject: params.subject,
+      email_body: html,
+      design_template: 'simple',
+      ...(params.settings && { settings: params.settings }),
+    };
+
+    let result;
+    if (params.campaignId) {
+      result = await this.updateCampaign(params.campaignId, campaignData);
+    } else {
+      result = await this.createCampaign(campaignData);
+      // Update with body (create doesn't always accept email_body)
+      const newId = result?.campaign?.id || result?.id;
+      if (newId) {
+        result = await this.updateCampaign(newId, campaignData);
+      }
+    }
+
+    return {
+      campaign: result?.campaign || result,
+      template_used: params.template_id,
+      text_blocks_found: blocks.length,
+      blocks_replaced: replacements.length,
+    };
+  }
+
   // ===== EMAIL TEMPLATES =====
 
   async listEmailTemplates(params: any = {}) {
@@ -909,6 +1009,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'fluentcrm_update_campaign',
+        description: 'Update an existing campaign (subject, body, recipients, design template, settings)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            campaignId: { type: 'number', description: 'Campaign ID to update' },
+            title: { type: 'string', description: 'Campaign title' },
+            subject: { type: 'string', description: 'Email subject line' },
+            email_body: { type: 'string', description: 'HTML email body content' },
+            design_template: { type: 'string', description: 'Design template: "simple" (classic HTML editor), "visual_builder", "raw_classic", "raw_html"' },
+            template_id: { type: 'number', description: 'Email template ID to reference' },
+            settings: { type: 'object', description: 'Campaign settings including subscribers, sending_filter, mailer_settings' },
+          },
+          required: ['campaignId'],
+        },
+      },
+      {
+        name: 'fluentcrm_compose_campaign',
+        description: 'Create or update a campaign with a template applied. Fetches the template HTML, replaces content sections (greeting, body, signature), and saves it to the campaign. If campaignId is provided, updates that campaign; otherwise creates a new one.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            site: siteProp,
+            campaignId: { type: 'number', description: 'Existing campaign ID to update (omit to create new)' },
+            title: { type: 'string', description: 'Campaign title' },
+            subject: { type: 'string', description: 'Email subject line' },
+            template_id: { type: 'number', description: 'Email template ID to use as base design' },
+            greeting: { type: 'string', description: 'Greeting/salutation HTML (replaces first text block)' },
+            body: { type: 'string', description: 'Main email body HTML (replaces second text block)' },
+            signature: { type: 'string', description: 'Signature HTML (replaces third text block)' },
+            settings: { type: 'object', description: 'Campaign settings including subscribers, sending_filter' },
+          },
+          required: ['title', 'subject', 'template_id'],
+        },
+      },
+      {
         name: 'fluentcrm_pause_campaign',
         description: 'Wstrzymuje kampanię',
         inputSchema: {
@@ -1383,6 +1520,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.listCampaigns(args || {}), null, 2) }] };
       case 'fluentcrm_create_campaign':
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.createCampaign(args as any), null, 2) }] };
+      case 'fluentcrm_update_campaign': {
+        const { campaignId, site: _s, subject, ...updateData } = args as any;
+        if (subject) updateData.email_subject = subject;
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.updateCampaign(campaignId, updateData), null, 2) }] };
+      }
+      case 'fluentcrm_compose_campaign':
+        return { content: [{ type: 'text', text: JSON.stringify(await siteClient.composeCampaignWithTemplate(args as any), null, 2) }] };
       case 'fluentcrm_pause_campaign':
         return { content: [{ type: 'text', text: JSON.stringify(await siteClient.pauseCampaign((args as any)?.campaignId), null, 2) }] };
       case 'fluentcrm_resume_campaign':

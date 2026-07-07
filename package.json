@@ -1,6 +1,6 @@
 {
   "name": "fluentcrm-mcp-server",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MCP Server for FluentCRM - Manage marketing automation and CRM operations from Cursor",
   "type": "module",
   "main": "dist/fluentcrm-mcp-server.js",
